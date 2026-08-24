@@ -15,12 +15,12 @@ import {
 
 // ---------------------------------------------------------------------------
 // Broker holding — who is accumulating vs distributing a stock over a window.
-// Same view as nepsealpha.com/broker-holding. Primary source was
-// chukul.com's public floorsheet aggregates (nepsealpha has no public API),
-// but chukul gated /top-net-holding|release behind Bearer auth in late-2025
-// (403). The section now tries chukul first and transparently falls back to
-// NEPSE's official floorsheet (intraday) with broker-name enrichment via
-// chukul's still-public /api/broker/ directory. See lib/broker-holding.ts.
+// Mirrors https://nepsealpha.com/broker-holding?symbol=SKHEL weekly/monthly.
+// Primary source is nepsealpha.com/broker-holding/filter (historical
+// floorsheet aggregated over true weekly/monthly windows, Cloudflare-bypassed
+// via cloudscraper). Secondary is chukul.com top-net-holding/release (now
+// 403) and tertiary is NEPSE intraday floorsheet. Broker names enriched via
+// chukul's still-public /api/broker/. See lib/broker-holding.ts.
 // ---------------------------------------------------------------------------
 
 function formatRangeDate(iso: string): string {
@@ -216,9 +216,9 @@ export function BrokerHoldingSection({ symbol }: { symbol: string }) {
             />
           </div>
           <p className="text-[10px] leading-relaxed text-muted-foreground">
-            Net broker positions derived from floor sheet buyer/seller records ({range}) — NEPSE anonymizes brokers
-            while the market is open, so intraday charts show the last visible after-close snapshot when available. Hover a bar for
-            the brokerage name, average rate, and net amount. Source: NEPSE (floorsheet) · broker names via chukul.com.
+            Net broker positions aggregated from historical floor sheet records ({range}) — weekly = 7 trading days,
+            monthly = 30 days. Hover a bar for brokerage name, avg rate and net amount. Source: nepsealpha.com
+            (broker-holding/filter, Cloudflare-bypassed) · broker names via chukul.com · fallback NEPSE intraday.
           </p>
         </div>
       ) : null}

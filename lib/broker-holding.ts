@@ -1,33 +1,39 @@
 // ---------------------------------------------------------------------------
 // Per-symbol broker holding / selling aggregates.
 //
-// PRIMARY: chukul.com's public API (floorsheet-derived aggregates):
-//   GET /api/data/top-net-holding/?symbol=X&from_date=&to_date=  → buy rows per broker
-//   GET /api/data/top-net-release/?symbol=X&from_date=&to_date=  → sell rows per broker
+// PRIMARY (2026): nepsealpha.com's broker-holding/filter endpoint (historical
+//   floorsheet aggregated over a true weekly/monthly window):
+//   GET https://nepsealpha.com/broker-holding/filter?symbol=X&range=W|M
+//     → { floor_sheet: {a:[], b:[], s:[], d:[], q:[]}, date_range: [from,to] }
+//   where for each trade index i:
+//     b[i] = buyer broker_no (string), s[i] = seller broker_no,
+//     q[i] = quantity (Kitta), a[i] = amount (Rs), d[i] = date (YYYY-MM-DD)
+//   range=W → weekly (~7 trading days), range=M → monthly (~30 days)
+//   This endpoint is behind Cloudflare (cf-mitigated challenge) — plain
+//   server-side fetch gets 403 "Just a moment...". We bypass via `cloudscraper`
+//   (Node) which solves the challenge and returns JSON. Verified via
+//   python/cloudscraper and Node cloudscraper 4.6.0 (see research).
+//   Example verified: SKHEL M 2026-07-21–2026-08-23 → 2343 trades, W 481 trades.
+//
+// SECONDARY (legacy): chukul.com's public API:
+//   GET /api/data/top-net-holding/?symbol=X&from_date=&to_date=  → buy rows
+//   GET /api/data/top-net-release/?symbol=X&from_date=&to_date=  → sell rows
 //   GET /api/broker/                                             → broker directory
+//   Since late-2025 chukul gated holding/release behind Bearer auth
+//   (403 {"detail":"Authentication credentials were not provided."}) — now
+//   always 403 for anonymous callers. Broker directory remains public.
 //
-// Since late-2025 chukul gated the holding/release endpoints behind
-// `Authorization: Bearer <token>` (Django returns
-//   403 {"detail":"Authentication credentials were not provided."}
-// when the header is missing) — so unauthenticated fetches now always 403.
-// The broker directory and stock endpoints remain public (200). This broke the
-// old chukul-only implementation (history: "it used to working before").
+// TERTIARY FALLBACK: NEPSE official floorsheet (intraday today only) via
+//   lib/nepse.ts → POST /api/nots/nepse-data/floorsheet?stockId=
+//   Aggregates today's tape by buyerMemberId/sellerMemberId. During market
+//   hours NEPSE anonymizes brokers (""), so we cache the last visible
+//   after-close snapshot (<5 days) and serve it while hidden.
 //
-// FALLBACK: Derive the same net position directly from NEPSE's official
-// floorsheet (lib/nepse.ts → /api/nots/nepse-data/floorsheet?stockId=) which
-// is authenticated via NEPSE's own token flow and never requires chukul.
-// The fallback aggregates today's floorsheet rows (NEPSE only exposes today's
-// trades) by buyerMemberId/sellerMemberId → net buy/sell per broker. When the
-// primary chukul fetch 403s we transparently return the NEPSE-derived result
-// so the UI never shows a 502. Weekly/monthly windows still return the range
-// metadata but the quantities reflect today's activity (NEPSE has no historical
-// broker-level endpoint). See fetchBrokerHolding() for the try→fallback logic.
-//
-// Holding  = brokers whose total buy exceeds total sales  (buy − sell > 0)
-// Selling  = brokers whose total sales exceed total buys  (sell − buy > 0)
+//   Holding  = buyQty - sellQty > 0 ; Selling = sellQty - buyQty > 0
 // ---------------------------------------------------------------------------
 
 const CHUKUL_BASE = "https://chukul.com"
+const NEPSEALPHA_BASE = "https://nepsealpha.com"
 
 const HEADERS = {
   "User-Agent":
@@ -36,18 +42,22 @@ const HEADERS = {
   Referer: "https://chukul.com/brokers-analytics",
 }
 
+const NEPSEALPHA_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+  Accept: "application/json, text/plain, */*",
+  "Accept-Language": "en-US,en;q=0.9",
+  Referer: "https://nepsealpha.com/broker-holding?symbol=SKHEL",
+  "X-Requested-With": "XMLHttpRequest",
+}
+
 export type BrokerHoldingPeriod = "weekly" | "monthly"
 
 export type BrokerFlow = {
-  /** Broker member number, e.g. "44" */
   broker: string
-  /** Full brokerage firm name when known */
   brokerName: string | null
-  /** Net quantity in Kitta (always positive; direction implied by the list) */
   quantity: number
-  /** Net amount in Rs (buy amount − sell amount, absolute) */
   amount: number
-  /** Volume-weighted average rate across the broker's trades in the window */
   avgRate: number | null
 }
 
@@ -56,9 +66,7 @@ export type BrokerHoldingData = {
   period: BrokerHoldingPeriod
   fromDate: string
   toDate: string
-  /** Top brokers accumulating (total buy − total sales), descending */
   holding: BrokerFlow[]
-  /** Top brokers distributing (sales exceeding purchase), descending */
   selling: BrokerFlow[]
 }
 
@@ -73,6 +81,17 @@ type RawFlowRow = {
 }
 
 type ChukulBroker = { broker_no?: string; broker_name?: string }
+
+type NepseAlphaFilterResponse = {
+  floor_sheet?: {
+    a?: number[]
+    b?: (string | number)[]
+    s?: (string | number)[]
+    d?: string[]
+    q?: number[]
+  }
+  date_range?: [string, string]
+}
 
 async function chukulGet<T>(path: string, revalidate: number): Promise<T> {
   const res = await fetch(`${CHUKUL_BASE}${path}`, {
@@ -102,7 +121,7 @@ async function fetchBrokerNames(): Promise<Map<string, string>> {
       if (b.broker_no && b.broker_name) map.set(String(b.broker_no), b.broker_name)
     }
   } catch {
-    // Broker names are decorative — charts still work without them.
+    // decorative
   }
   brokerNamesCache = { at: Date.now(), map }
   return map
@@ -110,10 +129,126 @@ async function fetchBrokerNames(): Promise<Map<string, string>> {
 
 type Tally = { buyQty: number; buyAmt: number; sellQty: number; sellAmt: number }
 
+// ---------------------------------------------------------------------------
+// NepseAlpha primary: uses cloudscraper to bypass Cloudflare
+// ---------------------------------------------------------------------------
+async function fetchBrokerHoldingViaNepseAlpha(
+  clean: string,
+  period: BrokerHoldingPeriod,
+  names: Map<string, string>
+): Promise<{ holding: BrokerFlow[]; selling: BrokerFlow[]; fromDate: string; toDate: string }> {
+  const range = period === "weekly" ? "W" : "M"
+  const url = `${NEPSEALPHA_BASE}/broker-holding/filter?symbol=${encodeURIComponent(clean)}&range=${range}`
+
+  // Cloudscraper is Node-only (uses `request` + JS challenge solver). Dynamically
+  // require it so the module can still be imported in edge/test environments
+  // where it isn't installed — fallback will then trigger.
+  let body: string
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const cloudscraper: { get: (url: string, opts?: unknown) => Promise<string> } = require("cloudscraper")
+    body = await cloudscraper.get(url, {
+      headers: {
+        ...NEPSEALPHA_HEADERS,
+        Referer: `https://nepsealpha.com/broker-holding?symbol=${encodeURIComponent(clean)}`,
+      },
+      timeout: 15000,
+    })
+  } catch (err) {
+    throw new Error(`nepsealpha cloudscraper failed for ${clean} ${period}: ${err instanceof Error ? err.message : String(err)}`)
+  }
+
+  let data: NepseAlphaFilterResponse
+  try {
+    data = JSON.parse(body) as NepseAlphaFilterResponse
+  } catch {
+    // If still HTML challenge page, surface as error to trigger fallback
+    if (body.includes("Just a moment") || body.includes("_cf_chl_opt")) {
+      throw new Error(`nepsealpha returned Cloudflare challenge for ${clean} ${period}`)
+    }
+    throw new Error(`nepsealpha returned non-JSON for ${clean} ${period}: ${body.slice(0, 200)}`)
+  }
+
+  const fs = data.floor_sheet
+  if (!fs || !Array.isArray(fs.a) || !Array.isArray(fs.b) || !Array.isArray(fs.s) || !Array.isArray(fs.q)) {
+    throw new Error(`nepsealpha missing floor_sheet arrays for ${clean} ${period}`)
+  }
+
+  const tallies = new Map<string, Tally>()
+  const tally = (broker: string): Tally => {
+    let t = tallies.get(broker)
+    if (!t) {
+      t = { buyQty: 0, buyAmt: 0, sellQty: 0, sellAmt: 0 }
+      tallies.set(broker, t)
+    }
+    return t
+  }
+
+  const n = fs.a.length
+  for (let i = 0; i < n; i++) {
+    const buyer = fs.b[i] != null ? String(fs.b[i]).trim() : ""
+    const seller = fs.s[i] != null ? String(fs.s[i]).trim() : ""
+    const qty = typeof fs.q[i] === "number" ? fs.q[i] : Number(fs.q[i])
+    const amt = typeof fs.a[i] === "number" ? fs.a[i] : Number(fs.a[i])
+    if (!Number.isFinite(qty) || qty <= 0) continue
+    const safeAmt = Number.isFinite(amt) ? amt : 0
+    if (buyer) {
+      const t = tally(buyer)
+      t.buyQty += qty
+      t.buyAmt += safeAmt
+    }
+    if (seller) {
+      const t = tally(seller)
+      t.sellQty += qty
+      t.sellAmt += safeAmt
+    }
+  }
+
+  const holding: BrokerFlow[] = []
+  const selling: BrokerFlow[] = []
+
+  for (const [broker, t] of tallies) {
+    const netQty = t.buyQty - t.sellQty
+    if (netQty === 0) continue
+    const buys = netQty > 0
+    const grossQty = buys ? t.buyQty : t.sellQty
+    const grossAmt = buys ? t.buyAmt : t.sellAmt
+    const flow: BrokerFlow = {
+      broker,
+      brokerName: names.get(broker) ?? null,
+      quantity: Math.abs(netQty),
+      amount: Math.round(Math.abs(t.buyAmt - t.sellAmt) * 100) / 100,
+      avgRate: grossQty > 0 ? Math.round((grossAmt / grossQty) * 100) / 100 : null,
+    }
+    ;(buys ? holding : selling).push(flow)
+  }
+
+  holding.sort((a, b) => b.quantity - a.quantity)
+  selling.sort((a, b) => b.quantity - a.quantity)
+
+  // Use nepsealpha's date_range when provided, else fallback to computed
+  let fromDate: string
+  let toDate: string
+  if (Array.isArray(data.date_range) && data.date_range.length === 2) {
+    fromDate = data.date_range[0]
+    toDate = data.date_range[1]
+  } else {
+    const days = period === "weekly" ? 7 : 30
+    fromDate = kathmanduDate(days)
+    toDate = kathmanduDate(0)
+  }
+
+  return {
+    holding: holding.slice(0, 10),
+    selling: selling.slice(0, 10),
+    fromDate,
+    toDate,
+  }
+}
+
 async function fetchBrokerHoldingViaChukul(
   clean: string,
   qs: string,
-  names: Map<string, string>,
 ): Promise<{ tallies: Map<string, Tally> }> {
   const [buyRows, sellRows] = await Promise.all([
     chukulGet<RawFlowRow[]>(`/api/data/top-net-holding/?${qs}`, 600),
@@ -151,12 +286,7 @@ const nepseSnapshotCache = new Map<string, { at: number; holding: BrokerFlow[]; 
 
 async function fetchBrokerHoldingViaNepse(
   clean: string,
-  names: Map<string, string>,
 ): Promise<{ tallies: Map<string, Tally>; sheetRows: number; attributableRows: number }> {
-  // Lazy import to avoid circular dependency at module load time; nepse.ts
-  // does not import broker-holding.ts so a static import would also work,
-  // but dynamic keeps the dependency explicit and avoids any init-order
-  // surprises with the nepse-api-helper WASM token handshake.
   const { fetchSecurities, fetchFloorsheet } = await import("@/lib/nepse")
 
   const securities = await fetchSecurities()
@@ -167,8 +297,6 @@ async function fetchBrokerHoldingViaNepse(
   try {
     sheet = await fetchFloorsheet(match.id)
   } catch (err) {
-    // Propagate as upstream error so the route returns 502 only when both
-    // chukul (403) AND NEPSE (e.g. 401 token failure) are down.
     throw new Error(`NEPSE floorsheet unavailable for ${clean}: ${err instanceof Error ? err.message : String(err)}`)
   }
 
@@ -187,8 +315,6 @@ async function fetchBrokerHoldingViaNepse(
     const qty = row.contractQuantity
     const amt = row.contractAmount
     if (!Number.isFinite(qty) || qty <= 0) continue
-    // NEPSE hides buyer/seller during trading hours (empty string) — skip
-    // those rows; they contribute no attributable broker flow.
     const hasBuyer = Boolean(row.buyerMemberId && String(row.buyerMemberId).trim())
     const hasSeller = Boolean(row.sellerMemberId && String(row.sellerMemberId).trim())
     if (hasBuyer || hasSeller) attributableRows++
@@ -233,73 +359,51 @@ function talliesToFlows(tallies: Map<string, Tally>, names: Map<string, string>)
 export async function fetchBrokerHolding(symbol: string, period: BrokerHoldingPeriod): Promise<BrokerHoldingData> {
   const clean = symbol.trim().toUpperCase()
   const days = period === "weekly" ? 7 : 30
-  const fromDate = kathmanduDate(days)
-  const toDate = kathmanduDate(0)
-  const qs = `symbol=${encodeURIComponent(clean)}&from_date=${fromDate}&to_date=${toDate}`
+  const fromDateFallback = kathmanduDate(days)
+  const toDateFallback = kathmanduDate(0)
+  const qs = `symbol=${encodeURIComponent(clean)}&from_date=${fromDateFallback}&to_date=${toDateFallback}`
 
-  // Broker names are decorative; fetch in parallel and tolerate missing.
   const names = await fetchBrokerNames()
 
-  // Try chukul's pre-aggregated window first — richer 7/30 day history when
-  // the endpoint is public. Since Q4-2025 it 403s for anonymous callers, in
-  // which case we fall through to the NEPSE floorsheet-derived path.
+  // 1) PRIMARY: nepsealpha (true weekly/monthly historical, Cloudflare-bypassed)
   try {
-    const { tallies } = await fetchBrokerHoldingViaChukul(clean, qs, names)
-    // If chukul returned at least one broker, trust it as the weekly/monthly
-    // window. An empty tally with 200 is valid (no trades) — return it rather
-    // than falling back and mixing semantics.
-    const { holding, selling } = talliesToFlows(tallies, names)
-    // Distinguish "chukul succeeded but market had no flow" (return empty
-    // correctly) from "chukul succeeded but bug gave empty despite trades".
-    // We already know chukul succeeded (no throw), so return its result even
-    // if empty. The outer catch only handles thrown/403 cases.
-    return { symbol: clean, period, fromDate, toDate, holding, selling }
+    const alpha = await fetchBrokerHoldingViaNepseAlpha(clean, period, names)
+    // alpha already sliced to 10 and has correct date_range
+    console.log(`[broker-holding] nepsealpha hit for ${clean} ${period}: ${alpha.holding.length} holding / ${alpha.selling.length} selling (${alpha.fromDate}→${alpha.toDate})`)
+    return { symbol: clean, period, fromDate: alpha.fromDate, toDate: alpha.toDate, holding: alpha.holding, selling: alpha.selling }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    // Expected path after chukul gated the endpoints:
-    //   "chukul.com responded 403 for /api/data/top-net-..."
-    // Log at warn so operators can tell the fallback fired.
-    console.warn(`[broker-holding] chukul primary failed for ${clean} (${period}): ${msg} — falling back to NEPSE floorsheet`)
+    console.warn(`[broker-holding] nepsealpha failed for ${clean} ${period}: ${msg} — falling back to chukul`)
   }
 
-  // Fallback: derive from NEPSE today's floorsheet (intraday, today's tape).
-  // Period distinction is kept for UI range display but quantity reflects
-  // today's attributable broker flow only (NEPSE has no historical broker API).
-  // During trading hours NEPSE anonymizes buyerMemberId/sellerMemberId (""),
-  // giving a 0-attributable sheet despite hundreds of trades — in that case
-  // we serve the last cached *visible* snapshot (after-close data) if one
-  // exists and is less than 5 trading days old, otherwise return empty with
-  // 200 (UI shows "No net accumulation" rather than a 502 error).
-  const { tallies, sheetRows, attributableRows } = await fetchBrokerHoldingViaNepse(clean, names)
+  // 2) SECONDARY: chukul (now 403, but keep for future if re-opened)
+  try {
+    const { tallies } = await fetchBrokerHoldingViaChukul(clean, qs)
+    const { holding, selling } = talliesToFlows(tallies, names)
+    return { symbol: clean, period, fromDate: fromDateFallback, toDate: toDateFallback, holding, selling }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.warn(`[broker-holding] chukul failed for ${clean} ${period}: ${msg} — falling back to NEPSE`)
+  }
+
+  // 3) TERTIARY: NEPSE intraday floorsheet (today only)
+  const { tallies, sheetRows, attributableRows } = await fetchBrokerHoldingViaNepse(clean)
   let { holding, selling } = talliesToFlows(tallies, names)
 
   const isHidden = sheetRows > 0 && attributableRows === 0
   const hasFlow = holding.length > 0 || selling.length > 0
 
   if (hasFlow) {
-    // Cache the visible result for the next hidden-window fallback.
-    nepseSnapshotCache.set(clean, { at: Date.now(), holding, selling, fromDate, toDate })
+    nepseSnapshotCache.set(clean, { at: Date.now(), holding, selling, fromDate: fromDateFallback, toDate: toDateFallback })
   } else if (isHidden) {
     const cached = nepseSnapshotCache.get(clean)
     const fresh = cached && Date.now() - cached.at < 5 * 24 * 60 * 60_000
     if (fresh && (cached.holding.length > 0 || cached.selling.length > 0)) {
-      console.warn(`[broker-holding] NEPSE sheet hidden for ${clean} (${sheetRows} trades, 0 attributable) — serving cached snapshot from ${cached.fromDate}–${cached.toDate}`)
-      // Keep the cached broker flows but update the range metadata to the
-      // requested period so the header dates remain correct.
-      return { symbol: clean, period, fromDate, toDate, holding: cached.holding, selling: cached.selling }
+      console.warn(`[broker-holding] NEPSE hidden for ${clean} (${sheetRows} trades) — serving cached snapshot from ${cached.fromDate}→${cached.toDate}`)
+      return { symbol: clean, period, fromDate: fromDateFallback, toDate: toDateFallback, holding: cached.holding, selling: cached.selling }
     }
-    // No cache yet (first request after server start during open hours) —
-    // return empty gracefully; UI will show the "no attributable flow"
-    // placeholder instead of a hard error.
-    console.warn(`[broker-holding] NEPSE sheet hidden for ${clean} (${sheetRows} trades) — no cached snapshot, returning empty`)
+    console.warn(`[broker-holding] NEPSE hidden for ${clean} (${sheetRows} trades) — no cache, returning empty`)
   }
 
-  return {
-    symbol: clean,
-    period,
-    fromDate,
-    toDate,
-    holding,
-    selling,
-  }
+  return { symbol: clean, period, fromDate: fromDateFallback, toDate: toDateFallback, holding, selling }
 }
