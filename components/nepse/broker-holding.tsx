@@ -137,6 +137,7 @@ function FlowChart({
 }
 
 const PERIODS: Array<{ value: BrokerHoldingPeriod; label: string }> = [
+  { value: "daily", label: "Daily" },
   { value: "weekly", label: "Weekly" },
   { value: "monthly", label: "Monthly" },
 ]
@@ -216,9 +217,11 @@ export function BrokerHoldingSection({ symbol }: { symbol: string }) {
             />
           </div>
           <p className="text-[10px] leading-relaxed text-muted-foreground">
-            Net broker positions aggregated from historical floor sheet records ({range}) — weekly = 7 trading days,
-            monthly = 30 days. Hover a bar for brokerage name, avg rate and net amount. Source: nepsealpha.com
-            (broker-holding/filter, Cloudflare-bypassed) · broker names via chukul.com · fallback NEPSE intraday.
+            Net broker positions aggregated from historical floor sheet records ({range}) — daily = single trading day
+            (last trading day during 11:00–15:00 NPT, today after close; auto-updates after close), weekly = 7 trading
+            days, monthly = 30 days. Hover a bar for brokerage name, avg rate and net amount. Source:
+            nepsealpha.com (broker-holding/filter, Cloudflare-bypassed) · broker names via chukul.com · fallback NEPSE
+            intraday.
           </p>
         </div>
       ) : null}

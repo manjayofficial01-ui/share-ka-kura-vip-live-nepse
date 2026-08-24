@@ -51,7 +51,7 @@ const NEPSEALPHA_HEADERS = {
   "X-Requested-With": "XMLHttpRequest",
 }
 
-export type BrokerHoldingPeriod = "weekly" | "monthly"
+export type BrokerHoldingPeriod = "daily" | "weekly" | "monthly"
 
 export type BrokerFlow = {
   broker: string
@@ -108,6 +108,39 @@ function kathmanduDate(daysAgo: number): string {
   return d.toLocaleDateString("en-CA", { timeZone: "Asia/Kathmandu" })
 }
 
+function kathmanduHour(): number {
+  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kathmandu" })).getHours()
+}
+
+function isWeekendKathmandu(dateStr: string): boolean {
+  // NEPSE trades Mon-Fri (per app footer). Sat/Sun are weekend.
+  const d = new Date(`${dateStr}T00:00:00`)
+  const w = d.getDay() // 0 Sun, 6 Sat
+  return w === 0 || w === 6
+}
+
+/** Last trading day before `today` (Kathmandu) that appears in `availableDates` if provided, else calendar previous weekday. */
+function getLastTradingDay(today: string, availableDates?: string[]): string {
+  if (availableDates && availableDates.length > 0) {
+    const sorted = [...new Set(availableDates)].sort()
+    // Find the most recent date < today
+    let candidate: string | null = null
+    for (const d of sorted) {
+      if (d < today) candidate = d
+    }
+    if (candidate) return candidate
+    // If no date < today (e.g., today is earliest), return latest available
+    return sorted[sorted.length - 1]
+  }
+  // Fallback calendar: go back 1..7 days until weekday Mon-Fri
+  for (let i = 1; i <= 7; i++) {
+    const cand = kathmanduDate(i)
+    const w = new Date(`${cand}T00:00:00`).getDay()
+    if (w !== 0 && w !== 6) return cand
+  }
+  return kathmanduDate(1)
+}
+
 let brokerNamesCache: { at: number; map: Map<string, string> } | null = null
 
 async function fetchBrokerNames(): Promise<Map<string, string>> {
@@ -137,7 +170,7 @@ async function fetchBrokerHoldingViaNepseAlpha(
   period: BrokerHoldingPeriod,
   names: Map<string, string>
 ): Promise<{ holding: BrokerFlow[]; selling: BrokerFlow[]; fromDate: string; toDate: string }> {
-  const range = period === "weekly" ? "W" : "M"
+  const range = period === "daily" ? "D" : period === "weekly" ? "W" : "M"
   const url = `${NEPSEALPHA_BASE}/broker-holding/filter?symbol=${encodeURIComponent(clean)}&range=${range}`
 
   // Cloudscraper is Node-only (uses `request` + JS challenge solver). Dynamically
@@ -174,6 +207,23 @@ async function fetchBrokerHoldingViaNepseAlpha(
     throw new Error(`nepsealpha missing floor_sheet arrays for ${clean} ${period}`)
   }
 
+  // For daily we need to pick a single target date: today after close, else last trading day.
+  let targetDailyDate: string | null = null
+  if (period === "daily") {
+    const today = kathmanduDate(0)
+    const hour = kathmanduHour()
+    const isTradingHour = hour >= 11 && hour < 15 && !isWeekendKathmandu(today)
+    const uniqueDates = [...new Set((fs.d || []) as string[])].sort()
+    if (isTradingHour) {
+      targetDailyDate = getLastTradingDay(today, uniqueDates)
+    } else {
+      if (uniqueDates.includes(today)) targetDailyDate = today
+      else targetDailyDate = getLastTradingDay(today, uniqueDates)
+    }
+    // If still null (no dates), fallback to today
+    if (!targetDailyDate) targetDailyDate = today
+  }
+
   const tallies = new Map<string, Tally>()
   const tally = (broker: string): Tally => {
     let t = tallies.get(broker)
@@ -186,6 +236,11 @@ async function fetchBrokerHoldingViaNepseAlpha(
 
   const n = fs.a.length
   for (let i = 0; i < n; i++) {
+    // Daily: only include trades for the target date
+    if (period === "daily" && targetDailyDate) {
+      const d = fs.d?.[i]
+      if (d !== targetDailyDate) continue
+    }
     const buyer = fs.b[i] != null ? String(fs.b[i]).trim() : ""
     const seller = fs.s[i] != null ? String(fs.s[i]).trim() : ""
     const qty = typeof fs.q[i] === "number" ? fs.q[i] : Number(fs.q[i])
@@ -226,10 +281,14 @@ async function fetchBrokerHoldingViaNepseAlpha(
   holding.sort((a, b) => b.quantity - a.quantity)
   selling.sort((a, b) => b.quantity - a.quantity)
 
-  // Use nepsealpha's date_range when provided, else fallback to computed
+  // Use nepsealpha's date_range when provided, else fallback to computed.
+  // For daily, fromDate/toDate are the single target date (today or last trading day).
   let fromDate: string
   let toDate: string
-  if (Array.isArray(data.date_range) && data.date_range.length === 2) {
+  if (period === "daily" && targetDailyDate) {
+    fromDate = targetDailyDate
+    toDate = targetDailyDate
+  } else if (Array.isArray(data.date_range) && data.date_range.length === 2) {
     fromDate = data.date_range[0]
     toDate = data.date_range[1]
   } else {
@@ -358,10 +417,28 @@ function talliesToFlows(tallies: Map<string, Tally>, names: Map<string, string>)
 
 export async function fetchBrokerHolding(symbol: string, period: BrokerHoldingPeriod): Promise<BrokerHoldingData> {
   const clean = symbol.trim().toUpperCase()
-  const days = period === "weekly" ? 7 : 30
-  const fromDateFallback = kathmanduDate(days)
-  const toDateFallback = kathmanduDate(0)
-  const qs = `symbol=${encodeURIComponent(clean)}&from_date=${fromDateFallback}&to_date=${toDateFallback}`
+  let fromDateFallback: string
+  let toDateFallback: string
+  let qs: string
+  if (period === "daily") {
+    const today = kathmanduDate(0)
+    const hour = kathmanduHour()
+    const isTradingHour = hour >= 11 && hour < 15 && !isWeekendKathmandu(today)
+    let target: string
+    if (isTradingHour) {
+      target = getLastTradingDay(today)
+    } else {
+      target = isWeekendKathmandu(today) ? getLastTradingDay(today) : today
+    }
+    fromDateFallback = target
+    toDateFallback = target
+    qs = `symbol=${encodeURIComponent(clean)}&from_date=${fromDateFallback}&to_date=${toDateFallback}`
+  } else {
+    const days = period === "weekly" ? 7 : 30
+    fromDateFallback = kathmanduDate(days)
+    toDateFallback = kathmanduDate(0)
+    qs = `symbol=${encodeURIComponent(clean)}&from_date=${fromDateFallback}&to_date=${toDateFallback}`
+  }
 
   const names = await fetchBrokerNames()
 
@@ -390,13 +467,14 @@ export async function fetchBrokerHolding(symbol: string, period: BrokerHoldingPe
   const { tallies, sheetRows, attributableRows } = await fetchBrokerHoldingViaNepse(clean)
   let { holding, selling } = talliesToFlows(tallies, names)
 
+  const cacheKey = `${clean}:${period}`
   const isHidden = sheetRows > 0 && attributableRows === 0
   const hasFlow = holding.length > 0 || selling.length > 0
 
   if (hasFlow) {
-    nepseSnapshotCache.set(clean, { at: Date.now(), holding, selling, fromDate: fromDateFallback, toDate: toDateFallback })
+    nepseSnapshotCache.set(cacheKey, { at: Date.now(), holding, selling, fromDate: fromDateFallback, toDate: toDateFallback })
   } else if (isHidden) {
-    const cached = nepseSnapshotCache.get(clean)
+    const cached = nepseSnapshotCache.get(cacheKey)
     const fresh = cached && Date.now() - cached.at < 5 * 24 * 60 * 60_000
     if (fresh && (cached.holding.length > 0 || cached.selling.length > 0)) {
       console.warn(`[broker-holding] NEPSE hidden for ${clean} (${sheetRows} trades) — serving cached snapshot from ${cached.fromDate}→${cached.toDate}`)

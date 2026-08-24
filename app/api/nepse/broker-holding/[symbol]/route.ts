@@ -11,7 +11,8 @@ export async function GET(req: Request, { params }: { params: Promise<{ symbol: 
   }
 
   const periodParam = new URL(req.url).searchParams.get("period")
-  const period: BrokerHoldingPeriod = periodParam === "monthly" ? "monthly" : "weekly"
+  const period: BrokerHoldingPeriod =
+    periodParam === "daily" ? "daily" : periodParam === "monthly" ? "monthly" : "weekly"
 
   try {
     const data = await fetchBrokerHolding(clean, period)

@@ -231,7 +231,7 @@ export type FloorsheetData = {
   totalTrades: number
 }
 
-export type BrokerHoldingPeriod = "weekly" | "monthly"
+export type BrokerHoldingPeriod = "daily" | "weekly" | "monthly"
 
 export type BrokerFlow = {
   broker: string
